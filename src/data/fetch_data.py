@@ -19,11 +19,11 @@ def fetch_stock_data(
         pd.DataFrame: Historical stock data
     """
 
-    data = yf.download(
-        tickers=ticker,
+    # Use Ticker.history as it is more reliable than download in some envs
+    stock = yf.Ticker(ticker)
+    data = stock.history(
         period=period,
-        interval=interval,
-        progress=False
+        interval=interval
     )
 
     if data is None or data.empty:
