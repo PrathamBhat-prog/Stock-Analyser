@@ -1,15 +1,19 @@
-# Virtual environment
+# Virtual environments
+venv/
 venv3/
-
-# Python cache
-__pycache__/
-*.pyc
 
 # Environment variables
 .env
 
+# MLflow
+mlruns/
+
 # Logs
 logs/
+
+# Python cache
+__pycache__/
+*.pyc
 
 # OS files
 .DS_Store
