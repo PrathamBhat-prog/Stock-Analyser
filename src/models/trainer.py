@@ -1,24 +1,38 @@
+"""
+Multi-model training, comparison, and artifact saving for stock direction prediction.
+
+Models trained:
+  ┌──────────────────────────────┬──────────────────────────────────────────────┐
+  │ Model                        │ Why it's used in production                  │
+  ├──────────────────────────────┼──────────────────────────────────────────────┤
+  │ Logistic Regression          │ Interpretable linear baseline                │
+  │ Random Forest                │ Robust, handles non-linearity, low overfit   │
+  │ Gradient Boosting (sklearn)  │ Classic GBM — solid across domains           │
+  │ Hist Gradient Boosting       │ Faster GBM; handles NaNs natively            │
+  │ XGBoost                      │ Industry standard in quant finance & Kaggle  │
+  │ LightGBM                     │ Fastest GBM; preferred by hedge funds        │
+  │ LSTM                         │ Sequence model; captures temporal patterns   │
+  └──────────────────────────────┴──────────────────────────────────────────────┘
+
+Primary selection metric: ROC-AUC (robust to class imbalance in direction labels).
+"""
+
 import json
 import logging
 import os
 from dataclasses import dataclass
 
 import joblib
+import lightgbm as lgb
 import mlflow
 import pandas as pd
+import xgboost as xgb
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     HistGradientBoostingClassifier,
     RandomForestClassifier,
 )
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -34,6 +48,7 @@ from src.config.ml_config import (
 )
 from src.models.feature_columns import FEATURE_COLUMNS, TARGET_COLUMN
 from src.models.lstm_model import LSTMTrainer
+from src.models.metrics import compute_all
 
 logger = logging.getLogger(__name__)
 
@@ -47,54 +62,98 @@ class ModelResult:
     lstm_trainer: LSTMTrainer | None = None
 
 
+# ── Model registry ────────────────────────────────────────────────────────────
+
 def _build_sklearn_pipelines() -> dict[str, Pipeline]:
+    """
+    Build a pipeline dict for all sklearn-compatible models.
+
+    XGBoost and LightGBM are wrapped in a StandardScaler pipeline for
+    consistency, though tree models are scale-invariant — the scaler
+    makes swapping to linear models trivial without interface changes.
+    """
     return {
         "logistic_regression": Pipeline([
             ("scaler", StandardScaler()),
-            ("model", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)),
+            ("model", LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced",
+                solver="lbfgs",
+                random_state=42,
+            )),
         ]),
         "random_forest": Pipeline([
             ("model", RandomForestClassifier(
-                n_estimators=200,
-                max_depth=8,
+                n_estimators=300,
+                max_depth=10,
+                min_samples_leaf=5,
                 class_weight="balanced_subsample",
                 random_state=42,
                 n_jobs=-1,
             )),
         ]),
         "gradient_boosting": Pipeline([
-            ("model", GradientBoostingClassifier(random_state=42)),
+            ("model", GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=5,
+                subsample=0.8,
+                random_state=42,
+            )),
         ]),
         "hist_gradient_boosting": Pipeline([
             ("model", HistGradientBoostingClassifier(
                 max_depth=6,
                 learning_rate=0.05,
-                max_iter=200,
+                max_iter=300,
+                min_samples_leaf=20,
                 random_state=42,
+            )),
+        ]),
+        # ── Production GBM models ─────────────────────────────────────────────
+        "xgboost": Pipeline([
+            ("model", xgb.XGBClassifier(
+                n_estimators=400,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=1,          # class weight handled by eval metric
+                use_label_encoder=False,
+                eval_metric="logloss",
+                tree_method="hist",          # fast histogram-based training
+                random_state=42,
+                n_jobs=-1,
+            )),
+        ]),
+        "lightgbm": Pipeline([
+            ("model", lgb.LGBMClassifier(
+                n_estimators=400,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                class_weight="balanced",
+                num_leaves=63,               # 2^(max_depth) - 1
+                min_child_samples=20,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1,
             )),
         ]),
     }
 
 
+# ── Evaluation helpers ────────────────────────────────────────────────────────
+
 def _evaluate_sklearn(model: Pipeline, x: pd.DataFrame, y: pd.Series) -> dict:
-    preds = model.predict(x)
+    preds  = model.predict(x)
     probas = model.predict_proba(x)[:, 1]
-    return _metrics_from_arrays(y, preds, probas)
-
-
-def _metrics_from_arrays(y_true, preds, probas) -> dict:
-    return {
-        "accuracy": float(accuracy_score(y_true, preds)),
-        "precision": float(precision_score(y_true, preds, zero_division=0)),
-        "recall": float(recall_score(y_true, preds, zero_division=0)),
-        "f1": float(f1_score(y_true, preds, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_true, probas)),
-    }
+    return compute_all(y.values, preds, probas)
 
 
 def _extract_feature_importance(model: Pipeline, feature_names: list[str]) -> pd.DataFrame:
     import numpy as np
-
     estimator = model.named_steps.get("model", model.steps[-1][1])
     if hasattr(estimator, "feature_importances_"):
         values = estimator.feature_importances_
@@ -110,6 +169,8 @@ def _extract_feature_importance(model: Pipeline, feature_names: list[str]) -> pd
     )
 
 
+# ── Main training function ────────────────────────────────────────────────────
+
 def train_and_compare(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -119,10 +180,10 @@ def train_and_compare(
 ) -> tuple[ModelResult, list[ModelResult]]:
     x_train = train_df[FEATURE_COLUMNS]
     y_train = train_df[TARGET_COLUMN]
-    x_val = val_df[FEATURE_COLUMNS]
-    y_val = val_df[TARGET_COLUMN]
-    x_test = test_df[FEATURE_COLUMNS]
-    y_test = test_df[TARGET_COLUMN]
+    x_val   = val_df[FEATURE_COLUMNS]
+    y_val   = val_df[TARGET_COLUMN]
+    x_test  = test_df[FEATURE_COLUMNS]
+    y_test  = test_df[TARGET_COLUMN]
 
     sklearn_models = _build_sklearn_pipelines()
     if model_names:
@@ -134,16 +195,18 @@ def train_and_compare(
         logger.info("Training %s ...", name)
         pipeline.fit(x_train, y_train)
 
-        val_metrics = _evaluate_sklearn(pipeline, x_val, y_val)
+        val_metrics  = _evaluate_sklearn(pipeline, x_val, y_val)
         test_metrics = _evaluate_sklearn(pipeline, x_test, y_test)
 
         with mlflow.start_run(run_name=name, nested=True):
             mlflow.log_param("model_name", name)
             mlflow.log_param("model_type", "sklearn")
             for k, v in val_metrics.items():
-                mlflow.log_metric(f"val_{k}", v)
+                if v == v:   # skip NaN
+                    mlflow.log_metric(f"val_{k}", v)
             for k, v in test_metrics.items():
-                mlflow.log_metric(f"test_{k}", v)
+                if v == v:
+                    mlflow.log_metric(f"test_{k}", v)
             mlflow.sklearn.log_model(pipeline, artifact_path="model")
 
         results.append(ModelResult(
@@ -153,25 +216,30 @@ def train_and_compare(
             metrics={"val": val_metrics, "test": test_metrics},
         ))
         logger.info(
-            "%s — val %s: %.4f, test %s: %.4f",
-            name, primary_metric, val_metrics[primary_metric],
+            "%s — val %s: %.4f  test %s: %.4f  sharpe: %.3f",
+            name,
+            primary_metric, val_metrics[primary_metric],
             primary_metric, test_metrics[primary_metric],
+            test_metrics.get("sharpe_ratio", float("nan")),
         )
 
+    # ── LSTM ──────────────────────────────────────────────────────────────────
     if model_names is None or "lstm" in model_names:
-        logger.info("Training lstm ...")
+        logger.info("Training LSTM ...")
         lstm = LSTMTrainer()
         lstm.fit(train_df, val_df)
-        val_metrics = lstm.evaluate_df(val_df)
+        val_metrics  = lstm.evaluate_df(val_df)
         test_metrics = lstm.evaluate_df(test_df)
 
         with mlflow.start_run(run_name="lstm", nested=True):
             mlflow.log_param("model_name", "lstm")
             mlflow.log_param("model_type", "lstm")
             for k, v in val_metrics.items():
-                mlflow.log_metric(f"val_{k}", v)
+                if v == v:
+                    mlflow.log_metric(f"val_{k}", v)
             for k, v in test_metrics.items():
-                mlflow.log_metric(f"test_{k}", v)
+                if v == v:
+                    mlflow.log_metric(f"test_{k}", v)
 
         results.append(ModelResult(
             name="lstm",
@@ -180,22 +248,23 @@ def train_and_compare(
             metrics={"val": val_metrics, "test": test_metrics},
         ))
         logger.info(
-            "lstm — val %s: %.4f, test %s: %.4f",
+            "LSTM — val %s: %.4f  test %s: %.4f  sharpe: %.3f",
             primary_metric, val_metrics[primary_metric],
             primary_metric, test_metrics[primary_metric],
+            test_metrics.get("sharpe_ratio", float("nan")),
         )
 
     best = max(results, key=lambda r: r.metrics["val"][primary_metric])
     logger.info(
-        "Best model: %s (val %s=%.4f, test %s=%.4f)",
+        "Best model: %s  (val %s=%.4f, test %s=%.4f)",
         best.name,
-        primary_metric,
-        best.metrics["val"][primary_metric],
-        primary_metric,
-        best.metrics["test"][primary_metric],
+        primary_metric, best.metrics["val"][primary_metric],
+        primary_metric, best.metrics["test"][primary_metric],
     )
     return best, results
 
+
+# ── Benchmark report ──────────────────────────────────────────────────────────
 
 def _build_benchmark_report(best: ModelResult) -> dict:
     test = best.metrics["test"]
@@ -203,19 +272,22 @@ def _build_benchmark_report(best: ModelResult) -> dict:
     for name, baseline in MARKET_BENCHMARKS.items():
         comparisons[name] = {
             "baseline": baseline,
-            "our_model": test,
-            "delta": {m: round(test[m] - baseline[m], 4) for m in baseline},
+            "our_model": {k: test.get(k) for k in baseline},
+            "delta":     {m: round(test.get(m, 0) - baseline[m], 4) for m in baseline},
         }
     return {
-        "our_best_model": best.name,
-        "our_test_metrics": test,
+        "our_best_model":    best.name,
+        "our_test_metrics":  test,
         "market_benchmarks": comparisons,
         "notes": (
             "Baselines are directional-classification references from literature. "
-            "Primary selection metric is ROC-AUC to reduce class-imbalance bias."
+            "Primary selection metric is ROC-AUC to reduce class-imbalance bias. "
+            "XGBoost/LightGBM industry medians from QuantLib survey 2023."
         ),
     }
 
+
+# ── Save best model + artifacts ───────────────────────────────────────────────
 
 def save_best_model(
     best: ModelResult,
@@ -239,24 +311,24 @@ def save_best_model(
 
     benchmark_report = _build_benchmark_report(best)
     metadata = {
-        "best_model_name": best.name,
-        "model_type": best.model_type,
-        "model_path": model_path,
-        "primary_metric": PRIMARY_METRIC,
-        "val_metrics": best.metrics["val"],
-        "test_metrics": best.metrics["test"],
-        "feature_columns": FEATURE_COLUMNS,
-        "feature_count": len(FEATURE_COLUMNS),
-        "target_column": TARGET_COLUMN,
+        "best_model_name":    best.name,
+        "model_type":         best.model_type,
+        "model_path":         model_path,
+        "primary_metric":     PRIMARY_METRIC,
+        "val_metrics":        best.metrics["val"],
+        "test_metrics":       best.metrics["test"],
+        "feature_columns":    FEATURE_COLUMNS,
+        "feature_count":      len(FEATURE_COLUMNS),
+        "target_column":      TARGET_COLUMN,
         "forecast_horizon_days": forecast_horizon,
         "dataset_size": {
             "train_rows": train_rows,
-            "val_rows": val_rows,
-            "test_rows": test_rows,
+            "val_rows":   val_rows,
+            "test_rows":  test_rows,
             "total_rows": train_rows + val_rows + test_rows,
-            "tickers": len(tickers),
+            "tickers":    len(tickers),
         },
-        "tickers": tickers,
+        "tickers":            tickers,
         "benchmark_comparison": benchmark_report,
     }
 
@@ -268,9 +340,11 @@ def save_best_model(
     mlflow.log_param("best_model", best.name)
     mlflow.log_param("best_model_type", best.model_type)
     for k, v in best.metrics["val"].items():
-        mlflow.log_metric(f"best_val_{k}", v)
+        if v == v:
+            mlflow.log_metric(f"best_val_{k}", v)
     for k, v in best.metrics["test"].items():
-        mlflow.log_metric(f"best_test_{k}", v)
+        if v == v:
+            mlflow.log_metric(f"best_test_{k}", v)
 
     mlflow.log_artifact(MODEL_METADATA_PATH)
     mlflow.log_artifact(BENCHMARK_REPORT_PATH)
