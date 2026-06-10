@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  stock-analyser:
+    build: .
+    container_name: stock-analyser-app
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.2
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+    command: >
+      mlflow ui
+      --backend-store-uri /mlruns
+      --host 0.0.0.0
+      --port 5000
+    restart: unless-stopped

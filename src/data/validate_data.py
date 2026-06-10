@@ -29,12 +29,14 @@ def validate_stock_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
 
+    df = df.copy()
+
     # 2. Check for missing values
     if df[REQUIRED_COLUMNS].isnull().any().any():
         df = df.dropna(subset=REQUIRED_COLUMNS)
 
     # 3. Ensure Date is datetime
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
 
     # 4. Sort by date
     df = df.sort_values("Date").reset_index(drop=True)

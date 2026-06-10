@@ -1,71 +1,54 @@
-class DecisionAggregationAgent:
+class MLDecisionAgent:
     """
-    Aggregates outputs from multiple agents
-    to produce a final trading decision.
+    Maps ML time-series model output to a final trading decision.
+    No rule-based technical or risk logic — ML probability only.
     """
 
-    def aggregate(self, technical_result: dict, risk_result: dict) -> dict:
-        """
-        Combine technical and risk agent outputs into a final decision.
+    BUY_THRESHOLD = 0.58
+    SELL_THRESHOLD = 0.42
 
-        Parameters:
-            technical_result (dict): Output from TechnicalAnalysisAgent
-            risk_result (dict): Output from RiskAnalysisAgent
+    def decide(self, ml_result: dict) -> dict:
+        if not ml_result.get("available", False):
+            return {
+                "final_decision": "HOLD",
+                "confidence": 0.0,
+                "reasoning": ml_result.get(
+                    "reason",
+                    "ML model unavailable. Run `python train.py` first.",
+                ),
+                "agent_summary": {"ml": ml_result},
+            }
 
-        Returns:
-            dict: Final decision with reasoning
-        """
+        proba_up = ml_result["probability_up"]
+        horizon = ml_result.get("forecast_horizon_days", 5)
+        model_name = ml_result.get("model_name", "unknown")
 
-        signal = technical_result["signal"]
-        tech_confidence = technical_result["confidence"]
-
-        risk_level = risk_result["risk_level"]
-        risk_score = risk_result["risk_score"]
-
-        final_decision = "HOLD"
-        confidence = 0.5
-        reasoning = "Insufficient alignment between agents."
-
-        # --- Decision Logic ---
-
-        if signal == "BULLISH" and risk_level == "LOW":
+        if proba_up >= self.BUY_THRESHOLD:
             final_decision = "BUY"
-            confidence = min(tech_confidence * 1.1, 0.95)
+            confidence = proba_up
             reasoning = (
-                "Technical indicators show a bullish trend and market risk is low, "
-                "supporting a buy decision."
+                f"Time-series model ({model_name}) assigns {proba_up:.1%} probability "
+                f"that price rises over the next {horizon} trading days."
             )
-
-        elif signal == "BEARISH" and risk_level == "LOW":
+        elif proba_up <= self.SELL_THRESHOLD:
             final_decision = "SELL"
-            confidence = min(tech_confidence * 1.1, 0.95)
+            confidence = 1 - proba_up
             reasoning = (
-                "Technical indicators show a bearish trend and market risk is low, "
-                "supporting a sell decision."
+                f"Time-series model ({model_name}) assigns {1 - proba_up:.1%} probability "
+                f"that price falls over the next {horizon} trading days."
             )
-
-        elif risk_level == "HIGH":
+        else:
             final_decision = "HOLD"
-            confidence = max(0.4, 1 - risk_score)
+            confidence = max(proba_up, 1 - proba_up)
             reasoning = (
-                "Market risk is high, indicating elevated uncertainty. "
-                "Holding position is safer despite technical signals."
-            )
-
-        elif signal == "NEUTRAL":
-            final_decision = "HOLD"
-            confidence = 0.5
-            reasoning = (
-                "Technical indicators do not show a clear trend. "
-                "Holding position is recommended."
+                f"Time-series model ({model_name}) is uncertain "
+                f"({proba_up:.1%} up / {1 - proba_up:.1%} down). "
+                f"No clear edge for the next {horizon} trading days."
             )
 
         return {
             "final_decision": final_decision,
             "confidence": round(confidence, 2),
             "reasoning": reasoning,
-            "agent_summary": {
-                "technical": technical_result,
-                "risk": risk_result
-            }
+            "agent_summary": {"ml": ml_result},
         }

@@ -2,69 +2,70 @@ import json
 import os
 import mlflow
 
+from src.config.ml_config import (
+    MIN_INFERENCE_PERIOD,
+    MLFLOW_EXPERIMENT_INFERENCE,
+    SHORT_PERIODS,
+)
 from src.data.fetch_data import fetch_stock_data
 from src.data.validate_data import validate_stock_data
-from src.data.features import add_technical_indicators
+from src.data.features import add_time_series_features
 
-from src.agents.technical_agent import TechnicalAnalysisAgent
-from src.agents.risk_agent import RiskAnalysisAgent
-from src.agents.decision_agent import DecisionAggregationAgent
+from src.agents.ml_agent import MLPredictionAgent
+from src.agents.decision_agent import MLDecisionAgent
 
 
 class StockAnalysisPipeline:
     """
-    End-to-end pipeline with MLflow logging.
+    ML-only time-series inference pipeline with MLflow logging.
     """
 
     def __init__(self):
-        # 🔑 FORCE MLflow to use project-root/mlruns
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         mlruns_path = os.path.join(project_root, "mlruns")
 
         mlflow.set_tracking_uri(f"file:///{mlruns_path}")
-        mlflow.set_experiment("stock-analysis-pipeline")
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_INFERENCE)
 
-        self.technical_agent = TechnicalAnalysisAgent()
-        self.risk_agent = RiskAnalysisAgent()
-        self.decision_agent = DecisionAggregationAgent()
+        self.ml_agent = MLPredictionAgent()
+        self.decision_agent = MLDecisionAgent()
+
+    @staticmethod
+    def _effective_period(period: str) -> str:
+        """Ensure enough history for lag/rolling features."""
+        if period in SHORT_PERIODS:
+            return MIN_INFERENCE_PERIOD
+        return period
 
     def run(self, ticker: str, period: str = "1y") -> dict:
-        """
-        Run full pipeline and log results using MLflow.
-        """
-
         with mlflow.start_run():
-            # ---- Parameters ----
+            fetch_period = self._effective_period(period)
             mlflow.log_param("ticker", ticker)
             mlflow.log_param("period", period)
+            mlflow.log_param("fetch_period", fetch_period)
 
-            # ---- Data pipeline ----
-            df = fetch_stock_data(ticker=ticker, period=period)
+            df = fetch_stock_data(ticker=ticker, period=fetch_period)
             df = validate_stock_data(df)
-            df = add_technical_indicators(df)
+            df = add_time_series_features(df)
 
-            # ---- Agent outputs ----
-            technical_result = self.technical_agent.analyze(df)
-            risk_result = self.risk_agent.analyze(df)
+            ml_result = self.ml_agent.analyze(df)
+            decision = self.decision_agent.decide(ml_result)
 
-            decision = self.decision_agent.aggregate(
-                technical_result=technical_result,
-                risk_result=risk_result
-            )
-
-            # ---- Log agent decisions ----
-            mlflow.log_param("technical_signal", technical_result["signal"])
-            mlflow.log_param("risk_level", risk_result["risk_level"])
+            mlflow.log_param("ml_signal", ml_result.get("signal", "N/A"))
+            mlflow.log_param("ml_model", ml_result.get("model_name", "none"))
             mlflow.log_param("final_decision", decision["final_decision"])
 
-            # ---- Metrics ----
             mlflow.log_metric("confidence", decision["confidence"])
-            mlflow.log_metric("risk_score", risk_result["risk_score"])
+            if ml_result.get("available"):
+                mlflow.log_metric("ml_probability_up", ml_result["probability_up"])
 
-            # ---- Artifact ----
-            with open("decision.json", "w") as f:
+            artifact_path = os.path.join(
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
+                "decision.json",
+            )
+            with open(artifact_path, "w", encoding="utf-8") as f:
                 json.dump(decision, f, indent=2)
 
-            mlflow.log_artifact("decision.json")
+            mlflow.log_artifact(artifact_path)
 
         return decision

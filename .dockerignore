@@ -1,0 +1,22 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+venv3/
+
+# MLflow artifacts
+mlruns/
+
+# Runtime artifacts
+decision.json
+
+# OS
+.DS_Store
+Thumbs.db

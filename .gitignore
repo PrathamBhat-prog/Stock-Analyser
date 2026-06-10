@@ -8,6 +8,12 @@ venv3/
 # MLflow
 mlruns/
 
+# Trained models (regenerate with train.py)
+artifacts/
+
+# Runtime inference output
+decision.json
+
 # Logs
 logs/
 

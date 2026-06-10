@@ -9,9 +9,9 @@ from src.pipelines.inference_pipeline import StockAnalysisPipeline
 # ------------------------
 
 app = FastAPI(
-    title="Multi-Agent Stock Analysis API",
-    description="End-to-end stock analysis using technical, risk, and decision agents",
-    version="1.0.0"
+    title="ML Time-Series Stock Analysis API",
+    description="End-to-end stock analysis using a trained time-series ML model",
+    version="2.0.0",
 )
 
 pipeline = StockAnalysisPipeline()
