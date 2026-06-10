@@ -1,209 +1,213 @@
-# ML Time-Series Stock Analyser
+# 📈 Multi-Agent Stock Analysis System with MLOps
 
-A quant-style machine learning pipeline that fetches live market data from **yfinance**, engineers time-series features, trains multiple models (including **LSTM**), compares them against market baselines, and serves **BUY / SELL / HOLD** decisions via API and Gradio UI.
+## 🚀 Overview
 
-> **Disclaimer:** This is a research/education project. Past performance does not guarantee future results. Not financial advice.
+This project is an **end-to-end stock analysis system** built using a **multi-agent architecture**, designed to generate **explainable BUY / SELL / HOLD decisions** rather than raw price predictions.
 
----
-
-## Architecture
-
-```
-yfinance (OHLCV)
-    │
-    ▼
-Data validation + time-series features (lags, rolling stats, momentum)
-    │
-    ▼
-Label: will price be higher in N days? (binary)
-    │
-    ▼
-Chronological train / val / test split (no lookahead leakage)
-    │
-    ▼
-Model comparison ──► Logistic Regression, Random Forest, Gradient Boosting, LSTM
-    │
-    ▼
-Best model selected by validation ROC-AUC
-    │
-    ▼
-Inference ──► BUY / SELL / HOLD + confidence + reasoning
-    │
-    ▼
-MLflow experiment tracking + artifact storage
-```
+The system emphasizes **clean ML engineering, modular decision-making, experiment tracking, and production readiness**, instead of black-box deep learning models.
 
 ---
 
-## Features
+## 🎯 Problem Statement
 
-- **32 tickers** (US large caps + India NSE) with **10 years** of history (~25k+ rows)
-- **36 time-series features**: lagged returns/prices/volume, rolling statistics, momentum
-- **5-day forward direction** prediction (binary classification)
-- **Models compared**: Logistic Regression, Random Forest, Gradient Boosting, HistGradientBoosting, **LSTM**
-- **Quant-style evaluation**: ROC-AUC primary metric, chronological splits, class balancing
-- **MLOps**: MLflow logging, model artifacts, benchmark comparison vs literature baselines
-- **Interfaces**: FastAPI (`/analyze`), Gradio UI, Docker Compose
+Most stock analysis projects fall into one of two extremes:
 
----
+- Simple rule-based scripts with no structure or scalability  
+- Overhyped deep learning models that are difficult to explain and deploy  
 
-## Quick Start
+The goal of this project was to build a **realistic, explainable, and production-oriented ML system** that:
 
-### 1. Setup
-
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### 2. Train models
-
-```powershell
-python train.py
-```
-
-Custom tickers / period:
-
-```powershell
-python train.py --tickers AAPL MSFT GOOGL --period 10y
-python train.py --models lstm random_forest
-```
-
-Training outputs:
-- `artifacts/models/best_model.joblib` or `best_model.pt` (LSTM)
-- `artifacts/models/model_metadata.json`
-- `artifacts/models/benchmark_comparison.json`
-- MLflow runs in `mlruns/`
-
-### 3. View experiments
-
-```powershell
-mlflow ui --backend-store-uri mlruns
-```
-
-Open http://localhost:5000
-
-### 4. Run inference
-
-**Gradio UI:**
-
-```powershell
-python -m src.ui.gradio_app
-```
-
-Open http://localhost:7860
-
-**FastAPI:**
-
-```powershell
-uvicorn src.main:app --reload
-```
-
-```bash
-curl -X POST http://localhost:8000/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"ticker": "AAPL", "period": "1y"}'
-```
-
-### 5. Docker
-
-```powershell
-docker compose up --build
-```
-
-- Gradio UI: http://localhost:7860
-- MLflow UI: http://localhost:5000
+- Uses **independent agents** for decision-making  
+- Produces **transparent and auditable outputs**  
+- Tracks system behavior using **MLOps tools**  
+- Can be deployed reproducibly using **containers**
 
 ---
 
-## Project Structure
+## 🛠️ Feature Engineering
 
-```
-src/
-  config/ml_config.py       # tickers, hyperparameters, paths
-  data/
-    fetch_data.py           # yfinance ingestion
-    validate_data.py        # schema checks
-    features.py             # time-series feature engineering
-    labeling.py             # forward-return labels
-    dataset.py              # multi-ticker dataset builder
-    sequences.py            # LSTM sequence windows
-  models/
-    feature_columns.py      # shared feature list
-    trainer.py              # multi-model training + comparison
-    lstm_model.py           # PyTorch LSTM classifier
-    predictor.py            # inference loader (sklearn or LSTM)
-  agents/
-    ml_agent.py             # ML prediction agent
-    decision_agent.py       # probability → BUY/SELL/HOLD
-  pipelines/
-    training_pipeline.py    # full training workflow
-    inference_pipeline.py   # full inference workflow
-  ui/gradio_app.py          # web UI
-  main.py                   # FastAPI
-train.py                    # training CLI
-verify_pipeline.py          # smoke test
-```
+Feature engineering is the process of converting **raw market data** into **meaningful, interpretable signals** that the system can reason about.
+
+Instead of using raw stock prices directly, the project derives **statistical indicators** that capture **trend** and **risk**, which are essential for decision-making.
+
+### 🔹 Simple Moving Averages (SMA 20 & SMA 50)
+
+- **SMA 20** represents short-term market behavior  
+- **SMA 50** represents medium-term market behavior  
+
+Moving averages smooth out short-term noise and highlight underlying trends.
+
+**How they are used in the system:**
+- If price is above both SMAs → bullish trend  
+- If price is below both SMAs → bearish trend  
+- Otherwise → neutral or sideways market  
+
+These features allow the system to reason about **trend direction** in a transparent and explainable way.
 
 ---
 
-## ML Workflow (what a quant engineer would do)
+### 🔹 Rolling Volatility
 
-| Step | What we do |
-|------|------------|
-| Data sourcing | yfinance daily OHLCV, multi-ticker universe |
-| Cleaning | Column validation, timezone normalization, sort by date |
-| Features | Lags (1–20d), rolling mean/std, momentum, volume ratios |
-| Label | Binary: `Close[t+5] > Close[t]` |
-| Split | Chronological 70/15/15 — no random shuffle |
-| Baselines | 4 sklearn models + LSTM sequence model |
-| Selection | Best validation **ROC-AUC** (robust to class imbalance) |
-| Evaluation | Accuracy, precision, recall, F1, ROC-AUC on held-out test set |
-| Benchmarks | Compared vs random guess, ARIMA proxy, LSTM/Transformer literature |
-| Tracking | MLflow params, metrics, artifacts |
-| Serving | Load best model, predict on latest window, map to action |
+Rolling volatility is computed as the **rolling standard deviation of returns** over a fixed window.
+
+**Why volatility matters:**
+- High volatility → higher uncertainty and risk  
+- Low volatility → more stable market conditions  
+
+Volatility is treated as a **risk feature**, independent of trend direction.  
+This separation ensures the system understands that a market can be trending but still risky.
 
 ---
 
-## Decision Logic
+## 🤖 Multi-Agent System Design
 
-| Condition | Action |
-|-----------|--------|
-| P(up) ≥ 0.58 | **BUY** |
-| P(up) ≤ 0.42 | **SELL** |
-| otherwise | **HOLD** |
+The system follows a **custom multi-agent architecture**, implemented using **plain Python classes** (no external agent frameworks).
 
----
-
-## Configuration
-
-Edit `src/config/ml_config.py`:
-
-- `DEFAULT_TRAIN_TICKERS` — training universe
-- `TRAIN_PERIOD` — yfinance history window (`10y`)
-- `FORECAST_HORIZON_DAYS` — prediction horizon (default 5)
-- `SEQUENCE_LENGTH` — LSTM lookback window (default 30)
-- `PRIMARY_METRIC` — model selection metric (`roc_auc`)
+Each agent has:
+- A **single responsibility**
+- Clearly defined inputs and outputs
+- Independent decision logic
+- Explainable reasoning
 
 ---
 
-## Limitations
+### 🔹 Technical Analysis Agent
 
-- yfinance is **not** tick-level real-time data
-- ~25k–80k rows is small vs production quant systems (millions+)
-- Directional accuracy near 50–55% is typical for daily equity prediction
-- No transaction costs, slippage, or portfolio optimization
-- Cloud deployment guide coming next
+**Responsibility:** Identify the market trend.
+
+**Inputs:**
+- Close price  
+- SMA 20  
+- SMA 50  
+
+**Outputs:**
+- Trend signal: Bullish / Bearish / Neutral  
+- Confidence score  
+- Human-readable explanation  
+
+This agent focuses purely on **trend detection** and does not consider risk.
 
 ---
 
-## Author
+### 🔹 Risk Analysis Agent
 
-**Pratham Bhat** — [PrathamBhat-prog](https://github.com/PrathamBhat-prog)
+**Responsibility:** Assess market risk and uncertainty.
+
+**Inputs:**
+- Rolling volatility  
+
+**Outputs:**
+- Risk level: Low / Medium / High  
+- Risk score  
+- Explanation  
+
+This agent is intentionally decoupled from trend logic, ensuring proper separation of concerns.
 
 ---
 
-## License
+### 🔹 Decision Aggregation Agent
 
-MIT
+**Responsibility:** Combine outputs from multiple agents to make a final decision.
+
+**Inputs:**
+- Technical agent output  
+- Risk agent output  
+
+**Outputs:**
+- Final decision: BUY / SELL / HOLD  
+- Overall confidence  
+- Reasoning  
+- Agent-level summary  
+
+This agent performs **multi-agent coordination**, resolving conflicts and balancing signals.
+
+---
+## 🔬 MLOps: Experiment Tracking with MLflow
+
+MLflow is integrated to track **inference-time experiments**, not model training.
+
+Instead of tracking loss or accuracy, the system logs **decision behavior** for each analysis run.
+
+### What is tracked per run
+
+- Input parameters (stock ticker, time period)
+- Outputs from individual agents (trend signal, risk level)
+- Metrics such as confidence score and risk score
+- Artifacts containing the final decision in JSON format
+
+### Why this matters
+
+This allows:
+- Auditing and explaining past decisions
+- Comparing system behavior across different market conditions
+- Debugging logic changes safely
+- Applying MLOps principles beyond model training
+
+This demonstrates a **production-oriented approach to ML systems**, where inference behavior is monitored just like training experiments.
+
+---
+
+## 🖥️ Interactive UI with Gradio
+
+A **Gradio-based web interface** was developed to make the system interactive and user-friendly.
+
+The UI allows users to:
+- Select a stock ticker and time period
+- View the final BUY / SELL / HOLD decision
+- Inspect agent-level reasoning
+- Visualize price trends along with moving averages
+
+This confirms that the system works **end-to-end**, not just as backend logic.
+
+---
+
+## 🐳 Containerization with Docker
+
+The entire application is containerized using **Docker** to ensure:
+
+- Reproducibility across environments
+- Stable dependency management
+- Elimination of “works on my machine” issues
+
+All dependencies are explicitly version-pinned to avoid runtime incompatibilities, which is critical for production systems.
+
+---
+
+## 🔧 Service Orchestration with Docker Compose
+
+Docker Compose is used to orchestrate multiple services that together form the system:
+
+- Stock analysis application (Gradio + ML pipeline)
+- MLflow UI for experiment tracking
+- Shared experiment storage (`mlruns`)
+
+This setup mirrors real-world ML deployments where services are decoupled but interconnected.
+
+Docker Compose enables:
+- Single-command startup
+- Clear service boundaries
+- Consistent local deployment
+
+---
+
+## ⭐ Key Engineering Highlights
+
+- Modular multi-agent architecture
+- Explainable ML decision-making
+- Feature engineering on time-series data
+- Inference-level experiment tracking
+- Dockerized deployment
+- Multi-service orchestration using Docker Compose
+
+---
+
+## 🧰 Tech Stack
+
+- **Language:** Python  
+- **Data & ML:** Pandas, NumPy  
+- **MLOps:** MLflow  
+- **UI:** Gradio  
+- **DevOps:** Docker, Docker Compose  
+
+---
+
