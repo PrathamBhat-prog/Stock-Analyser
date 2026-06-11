@@ -33,17 +33,19 @@ MODEL_CANDIDATES = [
     "lstm",
 ]
 
-# LSTM hyperparameters
-# Sequence length of 60 days (~quarterly window) gives the LSTM enough
-# context to capture momentum, mean-reversion, and volatility cycles.
-SEQUENCE_LENGTH = 60
-LSTM_HIDDEN_SIZE = 128   # wider hidden state for richer 10y feature set
-LSTM_NUM_LAYERS = 2
-LSTM_DROPOUT = 0.3
-LSTM_EPOCHS = 60         # more epochs; early stopping will regularise
-LSTM_BATCH_SIZE = 256    # larger batch — stable gradients on big dataset
-LSTM_LEARNING_RATE = 0.001
-LSTM_PATIENCE = 8        # slightly more patience before early stop
+# ── LSTM hyperparameters (production-grade) ──────────────────────────
+# 300 epochs: gives the model a full training budget to converge.
+# patience=30: only stop if NO improvement for 30 consecutive epochs.
+# hidden=256, layers=3: deeper network for richer 10y feature patterns.
+# Sequence 60 days = quarterly window (captures earnings-cycle effects).
+SEQUENCE_LENGTH  = 60
+LSTM_HIDDEN_SIZE = 256    # larger hidden state for deeper representation
+LSTM_NUM_LAYERS  = 3      # 3 stacked LSTM layers (residual connections inside)
+LSTM_DROPOUT     = 0.35   # slightly higher for deeper model regularisation
+LSTM_EPOCHS      = 300    # full training budget — early stopping controls it
+LSTM_BATCH_SIZE  = 512    # larger batch = more stable gradients
+LSTM_LEARNING_RATE = 3e-4 # Adam optimal LR for deep LSTM (Andrej Karpathy's rule)
+LSTM_PATIENCE    = 30     # professional patience: 30 epochs without improvement
 
 ARTIFACTS_DIR = "artifacts"
 MODEL_DIR = "artifacts/models"

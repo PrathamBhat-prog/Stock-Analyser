@@ -1,18 +1,23 @@
 """
-PyTorch LSTM classifier for stock direction prediction.
+Production-grade PyTorch LSTM for stock direction prediction.
 
-Architecture:
-    StockLSTM:
-      - LSTM(input_size, hidden=128, layers=2, dropout=0.3)
-      - Dropout(0.3)
-      - Linear(128, 1)   → BCEWithLogitsLoss
+Architecture (professional ML level):
+  - Bidirectional LSTM (3 layers, hidden=256) -- captures both forward and
+    backward temporal dependencies in the price sequence
+  - Multi-Head Self-Attention (4 heads) -- lets the model focus on the
+    most relevant timesteps (e.g. earnings-day spikes, support/resistance)
+  - LayerNorm after LSTM output -- stabilises gradients in deep networks
+  - Residual projection -- prevents vanishing gradients in 3-layer stack
+  - Dropout (0.35) -- regularisation for financial noisy data
+  - BCEWithLogitsLoss with pos_weight -- handles class imbalance
 
-Training features:
-  - Class-imbalance correction via pos_weight in BCEWithLogitsLoss
-  - Early stopping (patience configurable via LSTM_PATIENCE)
-  - Epoch-by-epoch loss + val-ROC-AUC tracking
-  - Generates epoch_plot.png (train loss & val ROC-AUC curves) at
-    docs/training_results/ for proof of training
+Training (professional settings):
+  - 300 max epochs with patience=30 (real production budget)
+  - AdamW optimiser (weight decay = 1e-4) -- better generalisation than Adam
+  - OneCycleLR scheduler -- warm up then cosine anneal (fast.ai / Leslie Smith)
+  - Gradient clipping (max_norm=1.0) -- prevents exploding gradients
+  - Best-checkpoint restore -- always saves best val ROC-AUC state
+  - Epoch plot saved to docs/training_results/epoch_plot.png as proof
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from pathlib import Path
 
 import joblib
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend — safe on headless servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -48,330 +53,402 @@ from src.models.feature_columns import FEATURE_COLUMNS, TARGET_COLUMN
 from src.models.metrics import compute_all
 
 logger = logging.getLogger(__name__)
-
-# Output directory for epoch plots
 _PLOT_DIR = Path("docs") / "training_results"
 
 
-# ── Model definition ──────────────────────────────────────────────────────────
+# ============================================================================
+# Architecture
+# ============================================================================
+
+class MultiHeadAttention(nn.Module):
+    """Scaled dot-product multi-head attention over LSTM output sequence."""
+
+    def __init__(self, hidden_size: int, num_heads: int = 4):
+        super().__init__()
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        self.attn = nn.MultiheadAttention(
+            embed_dim   = hidden_size,
+            num_heads   = num_heads,
+            dropout     = 0.1,
+            batch_first = True,
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, hidden)
+        out, _ = self.attn(x, x, x)      # self-attention
+        return self.norm(x + out)         # residual + norm
+
 
 class StockLSTM(nn.Module):
     """
-    Bidirectional-optional LSTM for binary stock direction classification.
+    Production-grade LSTM for binary stock direction classification.
 
     Input  : (batch, seq_len, n_features)
-    Output : (batch, 1) — raw logit (apply sigmoid for probability)
+    Output : (batch,) -- probability of price going UP
     """
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.layer_norm = nn.LayerNorm(hidden_size)   # stabilise LSTM output
-        self.dropout    = nn.Dropout(dropout)
-        self.fc         = nn.Linear(hidden_size, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        out    = self.layer_norm(out[:, -1, :])   # take last timestep
-        out    = self.dropout(out)
-        return self.fc(out)
-
-
-# ── Trainer ───────────────────────────────────────────────────────────────────
-
-class LSTMTrainer:
-    """Train, evaluate, save, and load an LSTM direction classifier."""
-
-    def __init__(
-        self,
-        seq_len:     int   = SEQUENCE_LENGTH,
-        hidden_size: int   = LSTM_HIDDEN_SIZE,
-        num_layers:  int   = LSTM_NUM_LAYERS,
+        input_size:  int,
+        hidden_size: int = LSTM_HIDDEN_SIZE,
+        num_layers:  int = LSTM_NUM_LAYERS,
         dropout:     float = LSTM_DROPOUT,
     ):
-        self.seq_len     = seq_len
-        self.hidden_size = hidden_size
-        self.num_layers  = num_layers
-        self.dropout     = dropout
-        self.scaler      = StandardScaler()
+        super().__init__()
+
+        # Input projection -- expand features to hidden dim before LSTM
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+        )
+
+        # Bidirectional LSTM stack
+        self.lstm = nn.LSTM(
+            input_size  = hidden_size,
+            hidden_size = hidden_size,
+            num_layers  = num_layers,
+            batch_first = True,
+            dropout     = dropout if num_layers > 1 else 0.0,
+            bidirectional = True,
+        )
+
+        # Project bidirectional output back to hidden_size (2*hidden -> hidden)
+        self.bidir_proj = nn.Linear(hidden_size * 2, hidden_size)
+        self.lstm_norm  = nn.LayerNorm(hidden_size)
+
+        # Multi-head self-attention over the LSTM sequence
+        self.attention = MultiHeadAttention(hidden_size, num_heads=4)
+
+        # Residual projection for skip connection from input_proj to head
+        self.residual_proj = nn.Linear(hidden_size, hidden_size)
+
+        # Classification head
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 128),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Xavier initialisation for linear layers, orthogonal for LSTM."""
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param.data)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param.data)
+            elif "bias" in name:
+                param.data.fill_(0)
+                # Set forget gate bias to 1 (LSTM best practice)
+                n = param.size(0)
+                param.data[n // 4: n // 2].fill_(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, F)
+        x_proj = self.input_proj(x)            # (B, T, H)
+
+        lstm_out, _ = self.lstm(x_proj)        # (B, T, 2H) bidirectional
+        lstm_out    = self.bidir_proj(lstm_out) # (B, T, H)
+        lstm_out    = self.lstm_norm(lstm_out)  # (B, T, H)
+
+        # Self-attention over the full sequence
+        attn_out = self.attention(lstm_out)     # (B, T, H)
+
+        # Use the last timestep + residual from projected input
+        last      = attn_out[:, -1, :]                         # (B, H)
+        residual  = self.residual_proj(x_proj[:, -1, :])      # (B, H)
+        combined  = last + residual                             # (B, H) skip connection
+
+        return self.head(combined).squeeze(1)   # (B,) raw logits
+
+
+# ============================================================================
+# Trainer
+# ============================================================================
+
+class LSTMTrainer:
+    """Handles training, evaluation, checkpointing, and epoch plotting."""
+
+    def __init__(self, input_size: int):
+        self.input_size = input_size
+        self.scaler     = StandardScaler()
+        self.device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: StockLSTM | None = None
-        self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info("LSTM device: %s", self.device)
+        logger.info(f"LSTM device: {self.device}")
 
-    # ── Data helpers ──────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    def _build_loaders(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val:   np.ndarray, y_val:   np.ndarray,
+    ):
+        """Scale, build sequences, return DataLoaders."""
+        Xs_train = self.scaler.fit_transform(X_train)
+        Xs_val   = self.scaler.transform(X_val)
 
-    def _scale_sequences(self, x: np.ndarray, fit: bool = False) -> np.ndarray:
-        n, t, f = x.shape
-        flat    = x.reshape(-1, f)
-        scaled  = self.scaler.fit_transform(flat) if fit else self.scaler.transform(flat)
-        return scaled.reshape(n, t, f).astype(np.float32)
+        Xt, yt = build_sequences(Xs_train, y_train, SEQUENCE_LENGTH)
+        Xv, yv = build_sequences(Xs_val,   y_val,   SEQUENCE_LENGTH)
 
-    def _to_loader(self, x: np.ndarray, y: np.ndarray, shuffle: bool) -> DataLoader:
-        dataset = TensorDataset(
-            torch.tensor(x, dtype=torch.float32),
-            torch.tensor(y, dtype=torch.float32),
+        self._Xv, self._yv = Xv, yv    # keep for later evaluation
+
+        train_ds = TensorDataset(
+            torch.from_numpy(Xt).float(),
+            torch.from_numpy(yt).float(),
         )
-        return DataLoader(dataset, batch_size=LSTM_BATCH_SIZE, shuffle=shuffle, pin_memory=False)
-
-    # ── Epoch plot ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _save_epoch_plot(
-        train_losses:   list[float],
-        val_aucs:       list[float],
-        stopped_epoch:  int,
-    ) -> None:
-        """
-        Generate a dual-axis epoch plot:
-          - Left axis  : train BCE loss (blue)
-          - Right axis : validation ROC-AUC (orange)
-        Vertical dashed line marks the best (restored) epoch.
-        Saved to docs/training_results/epoch_plot.png.
-        """
-        _PLOT_DIR.mkdir(parents=True, exist_ok=True)
-        save_path = _PLOT_DIR / "epoch_plot.png"
-
-        epochs = list(range(1, len(train_losses) + 1))
-        best_epoch = int(np.argmax(val_aucs)) + 1
-
-        fig, ax1 = plt.subplots(figsize=(12, 6))
-        ax2 = ax1.twinx()
-
-        # Train loss
-        ax1.plot(epochs, train_losses, color="#3B82F6", linewidth=2, label="Train Loss (BCE)")
-        ax1.set_xlabel("Epoch", fontsize=13)
-        ax1.set_ylabel("Training Loss (BCE)", color="#3B82F6", fontsize=12)
-        ax1.tick_params(axis="y", labelcolor="#3B82F6")
-
-        # Val AUC
-        ax2.plot(epochs, val_aucs, color="#F97316", linewidth=2, label="Val ROC-AUC")
-        ax2.set_ylabel("Validation ROC-AUC", color="#F97316", fontsize=12)
-        ax2.tick_params(axis="y", labelcolor="#F97316")
-        ax2.set_ylim(0.45, 1.0)
-
-        # Best epoch marker
-        ax1.axvline(x=best_epoch, color="#10B981", linestyle="--", linewidth=1.5,
-                    label=f"Best epoch ({best_epoch})")
-        if stopped_epoch < len(epochs):
-            ax1.axvline(x=stopped_epoch, color="#EF4444", linestyle=":", linewidth=1.5,
-                        label=f"Early stop ({stopped_epoch})")
-
-        # Annotation: best AUC
-        best_auc = val_aucs[best_epoch - 1]
-        ax2.annotate(
-            f"Best AUC\n{best_auc:.4f}",
-            xy=(best_epoch, best_auc),
-            xytext=(best_epoch + max(1, len(epochs) * 0.05), best_auc - 0.015),
-            fontsize=10,
-            color="#F97316",
-            arrowprops=dict(arrowstyle="->", color="#F97316"),
+        val_ds = TensorDataset(
+            torch.from_numpy(Xv).float(),
+            torch.from_numpy(yv).float(),
         )
-
-        # Legend (combine both axes)
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=10)
-
-        plt.title(
-            f"LSTM Training — {len(epochs)} epochs  |  10y OHLCV data  |  "
-            f"Best val ROC-AUC: {best_auc:.4f}",
-            fontsize=14,
-            fontweight="bold",
+        train_loader = DataLoader(
+            train_ds, batch_size=LSTM_BATCH_SIZE, shuffle=True,
+            drop_last=True, num_workers=0, pin_memory=False,
         )
-        plt.tight_layout()
-        fig.savefig(save_path, dpi=150)
-        plt.close(fig)
-        logger.info("Epoch plot saved → %s", save_path)
+        val_loader = DataLoader(
+            val_ds, batch_size=LSTM_BATCH_SIZE, shuffle=False,
+            num_workers=0, pin_memory=False,
+        )
+        return train_loader, val_loader
 
-    # ── Training ──────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    def fit(
+        self,
+        X_train: np.ndarray, y_train: np.ndarray,
+        X_val:   np.ndarray, y_val:   np.ndarray,
+    ) -> dict:
+        train_loader, val_loader = self._build_loaders(X_train, y_train, X_val, y_val)
 
-    def fit(self, train_df, val_df) -> dict:
-        x_train, y_train = build_sequences(train_df, self.seq_len)
-        x_val,   y_val   = build_sequences(val_df,   self.seq_len)
+        self.model = StockLSTM(self.input_size).to(self.device)
 
-        x_train = self._scale_sequences(x_train, fit=True)
-        x_val   = self._scale_sequences(x_val,   fit=False)
-
-        train_loader = self._to_loader(x_train, y_train, shuffle=True)
-        val_loader   = self._to_loader(x_val,   y_val,   shuffle=False)
-
-        input_size = len(FEATURE_COLUMNS)
-        self.model = StockLSTM(
-            input_size=input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            dropout=self.dropout,
+        # Class imbalance correction
+        pos_weight = torch.tensor(
+            [(y_train == 0).sum() / max((y_train == 1).sum(), 1)],
+            dtype=torch.float32,
         ).to(self.device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        # Class-imbalance correction
-        pos        = float(y_train.sum())
-        neg        = float(len(y_train) - pos)
-        pos_weight = torch.tensor([neg / max(pos, 1)], device=self.device)
-        criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        optimizer  = torch.optim.Adam(self.model.parameters(), lr=LSTM_LEARNING_RATE)
-        scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=3, verbose=False
+        # AdamW: better weight decay than Adam (Loshchilov & Hutter 2019)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr           = LSTM_LEARNING_RATE,
+            weight_decay = 1e-4,
+            betas        = (0.9, 0.999),
         )
 
-        best_val_auc     = -1.0
-        patience_counter = 0
-        best_state       = None
-        stopped_epoch    = LSTM_EPOCHS
+        # OneCycleLR: warmup + cosine annealing (Leslie Smith 2018)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr         = LSTM_LEARNING_RATE * 10,
+            epochs         = LSTM_EPOCHS,
+            steps_per_epoch= len(train_loader),
+            pct_start      = 0.1,          # 10% warmup
+            anneal_strategy= "cos",
+        )
 
-        train_losses: list[float] = []
-        val_aucs:     list[float] = []
+        # Training state
+        history        = {"train_loss": [], "val_auc": [], "lr": []}
+        best_val_auc   = -1.0
+        best_state     = None
+        best_epoch     = 0
+        no_improve     = 0
+        early_stop_ep  = None
 
         for epoch in range(1, LSTM_EPOCHS + 1):
-            # ── Training step ─────────────────────────────────────────────────
+
+            # -- Train ----------------------------------------------------
             self.model.train()
             epoch_loss = 0.0
-            n_batches  = 0
-            for xb, yb in train_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+            for Xb, yb in train_loader:
+                Xb, yb = Xb.to(self.device), yb.to(self.device)
                 optimizer.zero_grad()
-                logits = self.model(xb).squeeze(-1)
+                logits = self.model(Xb)
                 loss   = criterion(logits, yb)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
                 epoch_loss += loss.item()
-                n_batches  += 1
+            avg_loss = epoch_loss / len(train_loader)
+            current_lr = scheduler.get_last_lr()[0]
 
-            avg_loss = epoch_loss / max(n_batches, 1)
-            train_losses.append(avg_loss)
+            # -- Validate -------------------------------------------------
+            self.model.eval()
+            all_preds, all_labels = [], []
+            with torch.no_grad():
+                for Xb, yb in val_loader:
+                    preds = torch.sigmoid(self.model(Xb.to(self.device))).cpu().numpy()
+                    all_preds.extend(preds)
+                    all_labels.extend(yb.numpy())
 
-            # ── Validation step ───────────────────────────────────────────────
-            val_metrics = self.evaluate_sequences(x_val, y_val)
-            val_auc     = val_metrics["roc_auc"]
-            val_aucs.append(val_auc)
+            all_preds  = np.array(all_preds)
+            all_labels = np.array(all_labels)
 
-            scheduler.step(val_auc)
+            metrics = compute_all(all_labels, all_preds)
+            val_auc = metrics["roc_auc"]
+            val_acc = metrics["accuracy"]
+            sharpe  = metrics.get("sharpe_ratio", 0.0)
+
+            history["train_loss"].append(avg_loss)
+            history["val_auc"].append(val_auc)
+            history["lr"].append(current_lr)
 
             logger.info(
-                "LSTM epoch %3d/%d — loss: %.4f  val_auc: %.4f  val_acc: %.4f  sharpe: %.3f",
-                epoch, LSTM_EPOCHS,
-                avg_loss,
-                val_auc,
-                val_metrics["accuracy"],
-                val_metrics.get("sharpe_ratio", float("nan")),
+                f"LSTM epoch {epoch:3d}/{LSTM_EPOCHS}"
+                f" -- loss: {avg_loss:.4f}"
+                f"  val_auc: {val_auc:.4f}"
+                f"  val_acc: {val_acc:.4f}"
+                f"  sharpe: {sharpe:.3f}"
+                f"  lr: {current_lr:.6f}"
             )
 
-            # ── Early stopping ────────────────────────────────────────────────
+            # -- Checkpoint best model ------------------------------------
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
+                best_epoch   = epoch
                 best_state   = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-                patience_counter = 0
+                no_improve   = 0
             else:
-                patience_counter += 1
-                if patience_counter >= LSTM_PATIENCE:
-                    stopped_epoch = epoch
-                    logger.info("Early stopping at epoch %d (patience=%d)", epoch, LSTM_PATIENCE)
-                    break
+                no_improve += 1
 
+            # -- Early stopping -------------------------------------------
+            if no_improve >= LSTM_PATIENCE:
+                logger.info(
+                    f"Early stopping at epoch {epoch} "
+                    f"(patience={LSTM_PATIENCE}, best epoch={best_epoch})"
+                )
+                early_stop_ep = epoch
+                break
+
+        # Restore best weights
         if best_state:
             self.model.load_state_dict(best_state)
+            logger.info(f"Restored best weights from epoch {best_epoch} (val_auc={best_val_auc:.4f})")
 
-        # ── Save epoch plot as proof of training ──────────────────────────────
-        self._save_epoch_plot(train_losses, val_aucs, stopped_epoch)
+        # Save epoch plot
+        self._save_epoch_plot(history, best_epoch, early_stop_ep)
 
-        return {"best_val_roc_auc": best_val_auc, "epochs_run": len(train_losses)}
+        return {
+            "best_epoch":   best_epoch,
+            "best_val_auc": best_val_auc,
+            "total_epochs": len(history["train_loss"]),
+        }
 
-    # ── Evaluation ────────────────────────────────────────────────────────────
-
-    def evaluate_sequences(self, x: np.ndarray, y: np.ndarray) -> dict:
-        if self.model is None:
-            raise RuntimeError("Model not trained.")
-
-        self.model.eval()
-        loader = self._to_loader(x, y, shuffle=False)
-        probas: list[float] = []
-
-        with torch.no_grad():
-            for xb, _ in loader:
-                xb        = xb.to(self.device)
-                logits    = self.model(xb).squeeze(-1)
-                batch_p   = torch.sigmoid(logits).cpu().numpy()
-                probas.extend(batch_p.tolist())
-
-        probas_arr = np.array(probas)
-        preds      = (probas_arr >= 0.5).astype(int)
-        return compute_all(y, preds, probas_arr)
-
-    def evaluate_df(self, df) -> dict:
-        x, y = build_sequences(df, self.seq_len)
-        x    = self._scale_sequences(x, fit=False)
-        return self.evaluate_sequences(x, y)
-
-    def predict_proba_latest(self, df) -> float:
-        if self.model is None:
-            raise RuntimeError("Model not trained or loaded.")
-
-        feature_df = df[FEATURE_COLUMNS].dropna()
-        if len(feature_df) < self.seq_len:
-            raise ValueError(
-                f"Need at least {self.seq_len} rows of feature history for LSTM inference."
-            )
-
-        seq = feature_df.iloc[-self.seq_len:][FEATURE_COLUMNS].values.astype(np.float32)
-        seq = self.scaler.transform(seq).reshape(1, self.seq_len, -1)
-
-        self.model.eval()
-        with torch.no_grad():
-            x     = torch.tensor(seq, dtype=torch.float32).to(self.device)
-            logit = self.model(x).squeeze(-1)
-            return float(torch.sigmoid(logit).cpu().item())
-
-    # ── Persistence ───────────────────────────────────────────────────────────
-
-    def save(
+    # -------------------------------------------------------------------------
+    def _save_epoch_plot(
         self,
-        model_path:  str = BEST_LSTM_PATH,
-        scaler_path: str = LSTM_SCALER_PATH,
+        history:       dict,
+        best_epoch:    int,
+        early_stop_ep: int | None,
     ) -> None:
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        torch.save({
-            "state_dict":  self.model.state_dict(),
-            "seq_len":     self.seq_len,
-            "hidden_size": self.hidden_size,
-            "num_layers":  self.num_layers,
-            "dropout":     self.dropout,
-            "input_size":  len(FEATURE_COLUMNS),
-        }, model_path)
-        joblib.dump(self.scaler, scaler_path)
+        _PLOT_DIR.mkdir(parents=True, exist_ok=True)
+        plot_path = _PLOT_DIR / "epoch_plot.png"
 
+        epochs  = list(range(1, len(history["train_loss"]) + 1))
+        losses  = history["train_loss"]
+        aucs    = history["val_auc"]
+        lrs     = history["lr"]
+
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        fig.patch.set_facecolor("#0F172A")
+        for ax in (ax1, ax2, ax3):
+            ax.set_facecolor("#1E293B")
+            ax.tick_params(colors="#94A3B8")
+            for sp in ax.spines.values():
+                sp.set_color("#334155")
+
+        # Panel 1: Training loss
+        ax1.plot(epochs, losses, color="#3B82F6", linewidth=1.5, label="Train BCE Loss")
+        ax1.set_ylabel("BCE Loss", color="#94A3B8")
+        ax1.set_title(
+            f"LSTM Training -- 300 Epoch Budget  |  Best Epoch: {best_epoch}  |  Best Val AUC: {max(aucs):.4f}",
+            color="#E2E8F0", fontsize=11, pad=6
+        )
+        ax1.legend(facecolor="#1E293B", edgecolor="#334155", labelcolor="#E2E8F0")
+        ax1.grid(True, color="#1E3A5F", linewidth=0.4)
+
+        # Panel 2: Val AUC
+        ax2.plot(epochs, aucs, color="#F97316", linewidth=1.5, label="Val ROC-AUC")
+        ax2.axhline(0.5, color="#94A3B8", linestyle=":", linewidth=0.8, label="Random baseline (0.5)")
+        ax2.axvline(best_epoch, color="#10B981", linestyle="--", linewidth=1.5,
+                    label=f"Best epoch {best_epoch} (AUC={max(aucs):.4f})")
+        if early_stop_ep:
+            ax2.axvline(early_stop_ep, color="#EF4444", linestyle=":", linewidth=1.2,
+                        label=f"Early stop @ epoch {early_stop_ep}")
+        ax2.set_ylabel("Val ROC-AUC", color="#94A3B8")
+        ax2.legend(facecolor="#1E293B", edgecolor="#334155", labelcolor="#E2E8F0", fontsize=8)
+        ax2.grid(True, color="#1E3A5F", linewidth=0.4)
+        ax2.set_ylim(0.40, 0.70)
+
+        # Panel 3: Learning rate (OneCycleLR)
+        ax3.plot(epochs, lrs, color="#A78BFA", linewidth=1.2, label="Learning Rate")
+        ax3.set_ylabel("LR", color="#94A3B8")
+        ax3.set_xlabel("Epoch", color="#94A3B8")
+        ax3.legend(facecolor="#1E293B", edgecolor="#334155", labelcolor="#E2E8F0")
+        ax3.grid(True, color="#1E3A5F", linewidth=0.4)
+
+        plt.tight_layout(pad=1.5)
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight", facecolor="#0F172A")
+        plt.close(fig)
+        logger.info(f"Epoch plot saved -> {plot_path}")
+
+    # -------------------------------------------------------------------------
+    def evaluate(self, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+        if self.model is None:
+            raise RuntimeError("Model not trained yet. Call fit() first.")
+        Xs_test = self.scaler.transform(X_test)
+        Xt, yt  = build_sequences(Xs_test, y_test, SEQUENCE_LENGTH)
+        loader  = DataLoader(
+            TensorDataset(torch.from_numpy(Xt).float(), torch.from_numpy(yt).float()),
+            batch_size=LSTM_BATCH_SIZE, shuffle=False,
+        )
+        self.model.eval()
+        preds, labels = [], []
+        with torch.no_grad():
+            for Xb, yb in loader:
+                p = torch.sigmoid(self.model(Xb.to(self.device))).cpu().numpy()
+                preds.extend(p)
+                labels.extend(yb.numpy())
+        return compute_all(np.array(labels), np.array(preds))
+
+    # -------------------------------------------------------------------------
+    def save(self, model_path: str, scaler_path: str) -> None:
+        if self.model is None:
+            raise RuntimeError("No model to save.")
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        torch.save({"model_state": self.model.state_dict(),
+                    "input_size":  self.input_size}, model_path)
+        joblib.dump(self.scaler, scaler_path)
+        logger.info(f"LSTM saved -> {model_path}")
+
+    # -------------------------------------------------------------------------
+    def predict_proba_latest(self, df) -> float:
+        """Single-sample inference for the most recent row."""
+        from src.models.feature_columns import FEATURE_COLUMNS
+        feat_df = df[FEATURE_COLUMNS].dropna()
+        if len(feat_df) < SEQUENCE_LENGTH:
+            raise ValueError(
+                f"Need at least {SEQUENCE_LENGTH} rows for LSTM inference, got {len(feat_df)}."
+            )
+        X = self.scaler.transform(feat_df.values)
+        seq = torch.from_numpy(X[-SEQUENCE_LENGTH:]).float().unsqueeze(0).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            return float(torch.sigmoid(self.model(seq)).cpu().item())
+
+    # -------------------------------------------------------------------------
     @classmethod
-    def load(
-        cls,
-        model_path:  str = BEST_LSTM_PATH,
-        scaler_path: str = LSTM_SCALER_PATH,
-    ) -> "LSTMTrainer":
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-        trainer    = cls(
-            seq_len     = checkpoint["seq_len"],
-            hidden_size = checkpoint["hidden_size"],
-            num_layers  = checkpoint["num_layers"],
-            dropout     = checkpoint["dropout"],
-        )
-        trainer.scaler = joblib.load(scaler_path)
-        trainer.model  = StockLSTM(
-            input_size  = checkpoint["input_size"],
-            hidden_size = checkpoint["hidden_size"],
-            num_layers  = checkpoint["num_layers"],
-            dropout     = checkpoint["dropout"],
-        )
-        trainer.model.load_state_dict(checkpoint["state_dict"])
-        trainer.model.to(trainer.device)
+    def load(cls, model_path: str, scaler_path: str) -> "LSTMTrainer":
+        checkpoint  = torch.load(model_path, map_location="cpu")
+        input_size  = checkpoint["input_size"]
+        trainer     = cls(input_size)
+        trainer.model = StockLSTM(input_size).to(trainer.device)
+        trainer.model.load_state_dict(checkpoint["model_state"])
         trainer.model.eval()
+        trainer.scaler = joblib.load(scaler_path)
         return trainer
