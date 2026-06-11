@@ -64,90 +64,74 @@ BATCH_SIZE  = 512
 LR          = 3e-4
 
 
-# %% [CELL 4] ---- Feature engineering (60 features, same as production) ---
+# %% [CELL 4] ---- Feature engineering (12 lean features) -----------------
+# =============================================================================
+# 12 lean features -- one per signal category, all normalised & stationary
+# Why 12 not 60:
+#   - Raw prices removed (scale-dependent, can't generalise across tickers)
+#   - Redundant lags removed (lag_1 + lag_5 capture autocorrelation)
+#   - Duplicate indicators collapsed (BB_Pct beats BB_Mid/Upper/Lower)
+#   - Non-stationary series removed (OBV -> OBV_ROC_10)
+#   - Second RSI / second MACD line removed
+# =============================================================================
+
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
 
-    df["Daily_Return"] = close.pct_change()
-    df["Log_Return"]   = np.log(close / close.shift(1))
-
-    for lag in [1, 2, 3, 5, 10, 20]:
-        df[f"Return_lag_{lag}"] = df["Daily_Return"].shift(lag)
-        df[f"Close_lag_{lag}"]  = close.shift(lag)
-        df[f"Volume_lag_{lag}"] = vol.shift(lag)
-
-    for w in [5, 10, 20, 60]:
-        df[f"Return_mean_{w}"] = df["Daily_Return"].rolling(w).mean()
-        df[f"Return_std_{w}"]  = df["Daily_Return"].rolling(w).std()
-        df[f"Close_mean_{w}"]  = close.rolling(w).mean()
-        df[f"Volume_mean_{w}"] = vol.rolling(w).mean()
-
-    for p in [5, 10, 20, 60]:
-        df[f"Momentum_{p}"] = close.pct_change(p)
-
-    df["Volume_ratio_20"] = vol / vol.rolling(20).mean()
-    df["Volume_ratio_5"]  = vol / vol.rolling(5).mean()
-
-    for period in [14, 28]:
-        delta = close.diff()
-        gain  = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
-        loss  = (-delta).clip(lower=0).ewm(com=period-1, min_periods=period).mean()
-        rs    = gain / loss.replace(0, np.nan)
-        df[f"RSI_{period}"] = 100 - (100 / (1 + rs))
-
+    # 1. Current return
+    df["Daily_Return"]  = close.pct_change()
+    # 2-3. Autocorrelation lags
+    df["Return_lag_1"]  = df["Daily_Return"].shift(1)
+    df["Return_lag_5"]  = df["Daily_Return"].shift(5)
+    # 4. 20-day realised volatility
+    df["Return_std_20"] = df["Daily_Return"].rolling(20).std()
+    # 5. 20-day price momentum
+    df["Momentum_20"]   = close.pct_change(20)
+    # 6. RSI-14
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+    loss  = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+    df["RSI_14"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    # 7. MACD Histogram only (most informative single MACD signal)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd  = ema12 - ema26
-    sig   = macd.ewm(span=9, adjust=False).mean()
-    df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = macd, sig, macd - sig
-
-    bb_mid   = close.rolling(20).mean()
-    bb_std   = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    df["BB_Mid"]   = bb_mid
-    df["BB_Upper"] = bb_upper
-    df["BB_Lower"] = bb_lower
-    df["BB_Width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
-    df["BB_Pct"]   = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
-
+    df["MACD_Hist"] = macd - macd.ewm(span=9, adjust=False).mean()
+    # 8. Bollinger Band % position (normalised 0-1)
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    df["BB_Pct"] = (close - (bb_mid - 2*bb_std)) / (4 * bb_std).replace(0, np.nan)
+    # 9. ATR-14 as % of close (normalised volatility)
     prev_c = close.shift(1)
-    tr = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(axis=1)
-    df["ATR_14"]     = tr.ewm(com=13, min_periods=14).mean()
-    df["ATR_14_pct"] = df["ATR_14"] / close.replace(0, np.nan)
-
-    sign = np.sign(close.diff()).fillna(0)
-    df["OBV"]        = (sign * vol).cumsum()
-    df["OBV_ROC_10"] = df["OBV"].pct_change(10)
-
-    df["Close_vs_MA20"] = (close - close.rolling(20).mean()) / close.rolling(20).std().replace(0, np.nan)
-    df["Close_vs_MA60"] = (close - close.rolling(60).mean()) / close.rolling(60).std().replace(0, np.nan)
-    df["HL_Range"]      = (high - low) / close.replace(0, np.nan)
-    df["HL_Range_5ma"]  = df["HL_Range"].rolling(5).mean()
-    df["target"]        = (close.shift(-HORIZON) > close).astype(int)
+    tr     = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(axis=1)
+    df["ATR_14_pct"] = tr.ewm(com=13, min_periods=14).mean() / close.replace(0, np.nan)
+    # 10. OBV 10-day rate of change (stationary volume momentum)
+    obv = (np.sign(close.diff()).fillna(0) * vol).cumsum()
+    df["OBV_ROC_10"] = obv.pct_change(10)
+    # 11. Price vs 20d MA (z-score, trend regime)
+    df["Close_vs_MA20"] = (close - bb_mid) / close.rolling(20).std().replace(0, np.nan)
+    # 12. 5-day volume ratio (spike detection)
+    df["Volume_ratio_5"] = vol / vol.rolling(5).mean().replace(0, np.nan)
+    # Target
+    df["target"] = (close.shift(-HORIZON) > close).astype(int)
     return df
 
 FEATURE_COLS = [
-    "Daily_Return","Log_Return",
-    *[f"Return_lag_{l}" for l in [1,2,3,5,10,20]],
-    *[f"Close_lag_{l}"  for l in [1,2,3,5,10,20]],
-    *[f"Volume_lag_{l}" for l in [1,2,3,5,10,20]],
-    *[f"Return_mean_{w}" for w in [5,10,20,60]],
-    *[f"Return_std_{w}"  for w in [5,10,20,60]],
-    *[f"Close_mean_{w}"  for w in [5,10,20,60]],
-    *[f"Volume_mean_{w}" for w in [5,10,20,60]],
-    *[f"Momentum_{p}" for p in [5,10,20,60]],
-    "Volume_ratio_20","Volume_ratio_5",
-    "RSI_14","RSI_28",
-    "MACD","MACD_Signal","MACD_Hist",
-    "BB_Mid","BB_Upper","BB_Lower","BB_Width","BB_Pct",
-    "ATR_14","ATR_14_pct",
-    "OBV","OBV_ROC_10",
-    "Close_vs_MA20","Close_vs_MA60",
-    "HL_Range","HL_Range_5ma",
+    "Daily_Return",   # current return
+    "Return_lag_1",   # 1-day autocorrelation
+    "Return_lag_5",   # weekly pattern
+    "Return_std_20",  # 20-day volatility
+    "Momentum_20",    # 20-day trend
+    "RSI_14",         # overbought/oversold
+    "MACD_Hist",      # MACD crossover strength
+    "BB_Pct",         # Bollinger position
+    "ATR_14_pct",     # normalised intraday volatility
+    "OBV_ROC_10",     # volume momentum
+    "Close_vs_MA20",  # trend regime (z-score)
+    "Volume_ratio_5", # volume spike
 ]
-print(f"Feature count: {len(FEATURE_COLS)}")
+print(f"Feature count: {len(FEATURE_COLS)}  (lean production set)")
 
 
 # %% [CELL 5] ---- Fetch data + build dataset ------------------------------

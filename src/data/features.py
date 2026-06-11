@@ -1,174 +1,122 @@
 """
-Production-grade feature engineering for stock direction prediction.
+Lean feature engineering -- 12 high-signal, research-backed features.
 
-Feature categories (all derived from OHLCV — no lookahead leakage):
-  1. Returns & log-returns         — autoregressive price structure
-  2. Lagged returns / prices / vol  — memory effects (lags 1-20 d)
-  3. Rolling statistics              — local regime (5/10/20/60 d)
-  4. Momentum                        — trend-following signals
-  5. RSI (Relative Strength Index)   — mean-reversion signal
-  6. MACD + signal line              — trend-change detection
-  7. Bollinger Bands                 — volatility breakout
-  8. ATR (Average True Range)        — realised volatility proxy
-  9. OBV (On-Balance Volume)         — volume-price confluence
-  10. Volatility ratios               — regime change detection
+Reduced from 60 to 12 features by eliminating:
+  - Raw prices (scale-dependent, cannot generalise across tickers)
+  - Redundant lags (lag_1 and lag_5 capture autocorrelation adequately)
+  - Duplicate indicators (BB_Mid/Upper/Lower -> BB_Pct; ATR -> ATR_14_pct)
+  - Cumulative non-stationary features (OBV -> OBV_ROC_10)
+  - Multiple MACD lines (MACD_Hist is the single most informative)
+  - Second RSI period (RSI_14 is the industry standard)
+
+Final 12 features (one per signal category):
+  Daily_Return   -- current price impulse
+  Return_lag_1   -- 1-day autocorrelation
+  Return_lag_5   -- weekly memory effect
+  Return_std_20  -- 20-day realised volatility (risk)
+  Momentum_20    -- 20-day trend strength
+  RSI_14         -- overbought / oversold oscillator
+  MACD_Hist      -- MACD histogram (crossover strength)
+  BB_Pct         -- Bollinger Band position (normalised)
+  ATR_14_pct     -- normalised true range (intraday volatility)
+  OBV_ROC_10     -- 10-day volume momentum
+  Close_vs_MA20  -- price vs 20d MA (z-score, trend regime)
+  Volume_ratio_5 -- 5-day volume spike detection
+
+All features are: backward-looking, normalised, stationary, cross-ticker.
 """
 
 import numpy as np
 import pandas as pd
 
-# ── Lag / rolling window constants ────────────────────────────────────────────
-LAG_PERIODS      = [1, 2, 3, 5, 10, 20]
-ROLLING_WINDOWS  = [5, 10, 20, 60]       # 60-day (~quarterly) window added
-
-
-# ── Helper: EMA ───────────────────────────────────────────────────────────────
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-# ── RSI ───────────────────────────────────────────────────────────────────────
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-# ── MACD ──────────────────────────────────────────────────────────────────────
-def _macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast   = _ema(close, fast)
-    ema_slow   = _ema(close, slow)
-    macd_line  = ema_fast - ema_slow
-    signal_line = _ema(macd_line, signal)
-    histogram  = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-# ── Bollinger Bands ───────────────────────────────────────────────────────────
-def _bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
-    mid    = close.rolling(window).mean()
-    std    = close.rolling(window).std()
-    upper  = mid + num_std * std
-    lower  = mid - num_std * std
-    bw     = (upper - lower) / mid.replace(0, np.nan)   # bandwidth normalised
-    pct_b  = (close - lower) / (upper - lower).replace(0, np.nan)
-    return mid, upper, lower, bw, pct_b
-
-
-# ── ATR ───────────────────────────────────────────────────────────────────────
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(com=period - 1, min_periods=period).mean()
-
-
-# ── OBV ───────────────────────────────────────────────────────────────────────
-def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    sign = np.sign(close.diff()).fillna(0)
-    return (sign * volume).cumsum()
-
-
-# ── Main feature builder ──────────────────────────────────────────────────────
 
 def add_time_series_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build production-grade ML features from OHLCV history.
-
-    All features are strictly backward-looking — no future data leaks in.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain columns: Open, High, Low, Close, Volume (from yfinance).
-
-    Returns
-    -------
-    pd.DataFrame with all original columns plus engineered features.
+    Compute the 12 selected features in-place and return the DataFrame.
+    Requires columns: Open, High, Low, Close, Volume, Date.
     """
-    df = df.copy()
+    df = df.copy().sort_values("Date").reset_index(drop=True)
 
-    close  = df["Close"]
-    high   = df["High"]
-    low    = df["Low"]
-    volume = df["Volume"]
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    vol   = df["Volume"]
 
-    # ── 1. Returns ────────────────────────────────────────────────────────────
+    # 1. Daily return
     df["Daily_Return"] = close.pct_change()
-    df["Log_Return"]   = np.log(close / close.shift(1))
 
-    # ── 2. Lagged features ────────────────────────────────────────────────────
-    for lag in LAG_PERIODS:
-        df[f"Return_lag_{lag}"]  = df["Daily_Return"].shift(lag)
-        df[f"Close_lag_{lag}"]   = close.shift(lag)
-        df[f"Volume_lag_{lag}"]  = volume.shift(lag)
+    # 2-3. Lagged returns (autocorrelation)
+    df["Return_lag_1"] = df["Daily_Return"].shift(1)
+    df["Return_lag_5"] = df["Daily_Return"].shift(5)
 
-    # ── 3. Rolling statistics ─────────────────────────────────────────────────
-    for window in ROLLING_WINDOWS:
-        df[f"Return_mean_{window}"] = df["Daily_Return"].rolling(window).mean()
-        df[f"Return_std_{window}"]  = df["Daily_Return"].rolling(window).std()
-        df[f"Close_mean_{window}"]  = close.rolling(window).mean()
-        df[f"Volume_mean_{window}"] = volume.rolling(window).mean()
+    # 4. 20-day realised volatility
+    df["Return_std_20"] = df["Daily_Return"].rolling(20).std()
 
-    # ── 4. Momentum ───────────────────────────────────────────────────────────
-    df["Momentum_5"]  = close.pct_change(periods=5)
-    df["Momentum_10"] = close.pct_change(periods=10)
-    df["Momentum_20"] = close.pct_change(periods=20)
-    df["Momentum_60"] = close.pct_change(periods=60)
+    # 5. 20-day price momentum
+    df["Momentum_20"] = close.pct_change(20)
 
-    # ── 5. Volume dynamics ────────────────────────────────────────────────────
-    df["Volume_ratio_20"] = volume / volume.rolling(window=20).mean()
-    df["Volume_ratio_5"]  = volume / volume.rolling(window=5).mean()
+    # 6. RSI-14
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+    loss  = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    df["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # ── 6. RSI ────────────────────────────────────────────────────────────────
-    df["RSI_14"] = _rsi(close, period=14)
-    df["RSI_28"] = _rsi(close, period=28)
+    # 7. MACD Histogram (most informative single MACD signal)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    sig   = macd.ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = macd - sig
 
-    # ── 7. MACD ───────────────────────────────────────────────────────────────
-    macd_line, signal_line, macd_hist = _macd(close)
-    df["MACD"]         = macd_line
-    df["MACD_Signal"]  = signal_line
-    df["MACD_Hist"]    = macd_hist
+    # 8. Bollinger Band % position (normalised 0-1)
+    bb_mid   = close.rolling(20).mean()
+    bb_std   = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    df["BB_Pct"] = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
-    # ── 8. Bollinger Bands ────────────────────────────────────────────────────
-    bb_mid, bb_upper, bb_lower, bb_bw, bb_pct = _bollinger(close)
-    df["BB_Mid"]   = bb_mid
-    df["BB_Upper"] = bb_upper
-    df["BB_Lower"] = bb_lower
-    df["BB_Width"] = bb_bw     # normalised bandwidth (vol measure)
-    df["BB_Pct"]   = bb_pct   # position within bands (0–1)
+    # 9. ATR-14 as % of close (normalised volatility)
+    prev_c = close.shift(1)
+    tr     = pd.concat(
+        [high - low, (high - prev_c).abs(), (low - prev_c).abs()], axis=1
+    ).max(axis=1)
+    atr14          = tr.ewm(com=13, min_periods=14).mean()
+    df["ATR_14_pct"] = atr14 / close.replace(0, np.nan)
 
-    # ── 9. ATR ────────────────────────────────────────────────────────────────
-    df["ATR_14"] = _atr(high, low, close, period=14)
-    # Normalise by close to make it price-scale independent
-    df["ATR_14_pct"] = df["ATR_14"] / close.replace(0, np.nan)
+    # 10. OBV 10-day rate of change (stationary volume momentum)
+    sign = np.sign(close.diff()).fillna(0)
+    obv  = (sign * vol).cumsum()
+    df["OBV_ROC_10"] = obv.pct_change(10)
 
-    # ── 10. OBV ───────────────────────────────────────────────────────────────
-    df["OBV"] = _obv(close, volume)
-    # OBV momentum: rate-of-change over 10 days
-    df["OBV_ROC_10"] = df["OBV"].pct_change(periods=10)
+    # 11. Price position relative to 20d MA (z-score)
+    ma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std().replace(0, np.nan)
+    df["Close_vs_MA20"] = (close - ma20) / std20
 
-    # ── 11. Price vs moving averages (regime) ─────────────────────────────────
-    df["Close_vs_MA20"] = (close - close.rolling(20).mean()) / close.rolling(20).std().replace(0, np.nan)
-    df["Close_vs_MA60"] = (close - close.rolling(60).mean()) / close.rolling(60).std().replace(0, np.nan)
+    # 12. 5-day volume ratio (spike detection)
+    df["Volume_ratio_5"] = vol / vol.rolling(5).mean().replace(0, np.nan)
 
-    # ── 12. High-Low range ────────────────────────────────────────────────────
-    df["HL_Range"]     = (high - low) / close.replace(0, np.nan)
-    df["HL_Range_5ma"] = df["HL_Range"].rolling(5).mean()
+    # Label: 1 if price higher in 5 trading days
+    df["target_up"] = (close.shift(-5) > close).astype(int)
 
     return df
 
 
-# Backward-compatible alias used by existing imports
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    return add_time_series_features(df)
+# Canonical list -- import this everywhere
+FEATURE_COLUMNS = [
+    "Daily_Return",
+    "Return_lag_1",
+    "Return_lag_5",
+    "Return_std_20",
+    "Momentum_20",
+    "RSI_14",
+    "MACD_Hist",
+    "BB_Pct",
+    "ATR_14_pct",
+    "OBV_ROC_10",
+    "Close_vs_MA20",
+    "Volume_ratio_5",
+]
+
+TARGET_COLUMN = "target_up"
