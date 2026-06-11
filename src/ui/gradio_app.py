@@ -291,14 +291,16 @@ border:none !important;border-radius:10px !important;font-weight:700 !important;
 footer{display:none !important;}label{color:#94A3B8 !important;}
 """
 
-with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr.themes.Base()) as demo:
+with gr.Blocks(title="Stock Market AI Analyser", css=CSS, theme=gr.themes.Base()) as demo:
 
     gr.HTML("""<div style="text-align:center;padding:28px 0 14px;font-family:'Segoe UI',sans-serif;">
-      <div style="font-size:2.2rem;font-weight:900;color:#E2E8F0;">
-        ???? Should I <span style="color:#10B981;">Buy</span> or <span style="color:#EF4444;">Sell</span>?
+      <div style="font-size:2.2rem;font-weight:900;color:#E2E8F0;letter-spacing:-0.5px;">
+        Stock Market <span style="color:#3B82F6;">AI</span> Analyser
       </div>
       <div style="font-size:1rem;color:#64748B;margin-top:8px;">
-        Enter any company's ticker -- works for <strong style="color:#94A3B8;">any stock in the world</strong>.
+        AI-powered <strong style="color:#10B981;">BUY</strong> /
+        <strong style="color:#EF4444;">SELL</strong> /
+        <strong style="color:#F59E0B;">HOLD</strong> signals for any stock in the world.
         Choose your investment horizon from 1 week to 1 year.
       </div></div>""")
 
