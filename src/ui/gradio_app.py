@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Layman-friendly Gradio UI for the ML Stock Analyser.
 Frontend port: 7860  ->  http://localhost:7860
@@ -46,12 +47,12 @@ MODEL_INFO = """
 The recommendation is made by **two systems working together**:
 
 ### 1. ML Model (Hist Gradient Boosting)
-- **Type:** HistGradientBoostingClassifier (sklearn) — a production-grade tree ensemble
+- **Type:** HistGradientBoostingClassifier (sklearn) -- a production-grade tree ensemble
 - **Trained on:** 38,096 daily OHLCV rows from **32 companies** (US large-caps + India NSE)
 - **History:** 5 years of daily data per ticker
 - **Features:** 60 technical indicators (RSI, MACD, Bollinger Bands, ATR, OBV, momentum, lags, rolling stats)
 - **Task:** Predicts whether price will be **higher or lower in 5 trading days** (binary classification)
-- **No retraining at runtime** — model is loaded from saved file
+- **No retraining at runtime** -- model is loaded from saved file
 
 #### Real Accuracy Metrics (held-out test set)
 | Metric | Our Model | Random Guess | ARIMA Proxy | XGBoost Industry |
@@ -59,16 +60,16 @@ The recommendation is made by **two systems working together**:
 | **ROC-AUC** | **0.515** | 0.500 | 0.530 | 0.570 |
 | **F1 Score** | **0.579** | 0.500 | 0.520 | 0.560 |
 | Accuracy | 49.8% | 50.0% | 51.0% | 55.0% |
-| Precision | 49.0% | — | — | — |
-| Recall | 70.8% | — | — | — |
+| Precision | 49.0% | -- | -- | -- |
+| Recall | 70.8% | -- | -- | -- |
 
-> **Why only ~50% accuracy?** Daily stock direction prediction is one of the hardest problems in machine learning. The Efficient Market Hypothesis says all public information is already priced in. Academic literature shows 51-56% is typical — even 53% is economically significant at scale. Our F1 of 0.579 beats all baselines.
+> **Why only ~50% accuracy?** Daily stock direction prediction is one of the hardest problems in machine learning. The Efficient Market Hypothesis says all public information is already priced in. Academic literature shows 51-56% is typical -- even 53% is economically significant at scale. Our F1 of 0.579 beats all baselines.
 
 ### 2. Trend Analysis Agent (for medium/long-term horizons)
 - **Type:** Rule-based signal engine using 6 technical indicators
 - **Signals used:** MA alignment, RSI overbought/oversold, MACD crossover, Bollinger Band position, 20d momentum, volume confirmation
-- **Output:** Trend score in [-1, +1] with label (Strong Uptrend → Strong Downtrend)
-- **Works for ANY ticker** — no training required
+- **Output:** Trend score in [-1, +1] with label (Strong Uptrend -> Strong Downtrend)
+- **Works for ANY ticker** -- no training required
 
 ### Investment Horizon Blending
 | Horizon | ML Weight | Trend Weight |
@@ -143,8 +144,8 @@ def _decision_card(result):
     company = result.get("company", {})
     trend = result.get("trend", {})
     color = DECISION_COLORS.get(d, "#94A3B8")
-    icons = {"BUY": "📈", "SELL": "📉", "HOLD": "⏸️"}
-    icon = icons.get(d, "❓")
+    icons = {"BUY": "????", "SELL": "????", "HOLD": "??????"}
+    icon = icons.get(d, "???")
     trend_lbl = trend.get("trend_label", "Unknown")
     trend_col = TREND_COLORS.get(trend_lbl, "#94A3B8")
     curr_price = trend.get("current_price", 0.0)
@@ -250,7 +251,7 @@ def analyze_stock(ticker_text, quick_pick, period, horizon_label):
 
     signals = result.get("trend", {}).get("signals", [])
     signals_md = "\n\n".join(
-        f"{'🟢' if any(w in s.lower() for w in ['bull','ris','above','up','bounce']) else '🔴' if any(w in s.lower() for w in ['bear','fall','below','down','pull','losing']) else '⚪'} {s}"
+        f"{'????' if any(w in s.lower() for w in ['bull','ris','above','up','bounce']) else '????' if any(w in s.lower() for w in ['bear','fall','below','down','pull','losing']) else '???'} {s}"
         for s in signals
     ) or "No signals."
 
@@ -294,10 +295,10 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
 
     gr.HTML("""<div style="text-align:center;padding:28px 0 14px;font-family:'Segoe UI',sans-serif;">
       <div style="font-size:2.2rem;font-weight:900;color:#E2E8F0;">
-        📊 Should I <span style="color:#10B981;">Buy</span> or <span style="color:#EF4444;">Sell</span>?
+        ???? Should I <span style="color:#10B981;">Buy</span> or <span style="color:#EF4444;">Sell</span>?
       </div>
       <div style="font-size:1rem;color:#64748B;margin-top:8px;">
-        Enter any company's ticker — works for <strong style="color:#94A3B8;">any stock in the world</strong>.
+        Enter any company's ticker -- works for <strong style="color:#94A3B8;">any stock in the world</strong>.
         Choose your investment horizon from 1 week to 1 year.
       </div></div>""")
 
@@ -307,7 +308,7 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
             with gr.Accordion("How to use / What is a ticker?", open=False):
                 gr.Markdown("""
 **Step 1:** Type the ticker (e.g. `AAPL` for Apple, `RELIANCE.NS` for Reliance) OR pick from the dropdown.
-**Step 2:** Choose your **investment horizon** — how long you plan to hold.
+**Step 2:** Choose your **investment horizon** -- how long you plan to hold.
 **Step 3:** Click **Analyse Stock**.
 
 **Ticker examples:** `AAPL` (Apple) | `MSFT` (Microsoft) | `TSLA` (Tesla) | `RELIANCE.NS` | `TCS.NS` | `ASML.AS` | `005930.KS` (Samsung)
@@ -324,8 +325,10 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
             analyse_btn = gr.Button("Analyse Stock", variant="primary", size="lg")
             data_info = gr.Textbox(label="Company Info", interactive=False, max_lines=1)
             with gr.Row():
-                card_out = gr.HTML(scale=2)
-                chart_out = gr.Plot(label="Price + RSI + MACD", scale=3)
+                with gr.Column(scale=2):
+                    card_out = gr.HTML()
+                with gr.Column(scale=3):
+                    chart_out = gr.Plot(label="Price + RSI + MACD")
             signals_out = gr.Markdown(label="Technical Signal Breakdown")
 
             analyse_btn.click(fn=analyze_stock,
@@ -339,9 +342,9 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
                 wl_per = gr.Dropdown(label="Period", choices=PERIODS, value="2y", scale=1)
                 wl_hor = gr.Dropdown(label="Horizon", choices=list(HORIZON_CHOICES.keys()),
                                       value=list(HORIZON_CHOICES.keys())[0], scale=2)
-            gr.Button("Compare", variant="primary").click(
-                fn=analyze_watchlist, inputs=[wl_in, wl_per, wl_hor],
-                outputs=[gr.Dataframe(label="Results", wrap=True)])
+            compare_btn = gr.Button("Compare", variant="primary")
+            wl_out = gr.Dataframe(label="Results", wrap=True)
+            compare_btn.click(fn=analyze_watchlist, inputs=[wl_in, wl_per, wl_hor], outputs=[wl_out])
 
         with gr.Tab("How the AI Works"):
             gr.Markdown(MODEL_INFO)
@@ -353,16 +356,16 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
 |--------|---------|
 | **BUY** | AI thinks price is likely to rise in your chosen horizon |
 | **SELL** | AI thinks price is likely to fall in your chosen horizon |
-| **HOLD** | AI is not confident — safest to wait |
+| **HOLD** | AI is not confident -- safest to wait |
 
 ## Trend Labels
 | Trend | Meaning |
 |-------|---------|
-| **Strong Uptrend** | Consistently rising — buyers in control |
+| **Strong Uptrend** | Consistently rising -- buyers in control |
 | **Uptrend** | Gradually rising |
-| **Sideways** | No clear direction — consolidating |
+| **Sideways** | No clear direction -- consolidating |
 | **Downtrend** | Gradually falling |
-| **Strong Downtrend** | Consistently falling — sellers in control |
+| **Strong Downtrend** | Consistently falling -- sellers in control |
 
 ## RSI (Momentum)
 - **Overbought (>70):** Risen too fast, pullback possible
@@ -370,14 +373,14 @@ with gr.Blocks(title="Stock Analyser | Should I Buy or Sell?", css=CSS, theme=gr
 - **Bullish/Bearish/Neutral:** General momentum direction
 
 ## Volatility
-- **High:** Large daily swings — higher risk and reward
+- **High:** Large daily swings -- higher risk and reward
 - **Normal:** Typical movement
-- **Low:** Small swings — calmer market
+- **Low:** Small swings -- calmer market
 
 ## Investment Horizon
 - **1 Week:** Pure ML model signal (trained specifically for this)
 - **1 Month:** Equal ML + trend blend
-- **3/6 Months:** Trend-dominant — longer patterns matter more
+- **3/6 Months:** Trend-dominant -- longer patterns matter more
 - **1 Year:** Long-term trend analysis dominates
 
 ---
