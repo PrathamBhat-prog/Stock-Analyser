@@ -110,8 +110,12 @@ class StockAnalysisPipeline:
             # 2. Company metadata
             company_info = _get_company_info(ticker)
 
-            # 3. ML prediction (always runs for its short-term signal)
-            ml_result    = self.ml_agent.analyze(df)
+            # 3. ML prediction (Sniper v5 CatBoost with live sentiment)
+            ml_result    = self.ml_agent.analyze(
+                df           = df,
+                ticker       = ticker,
+                company_name = company_info.get("company_name", ticker),
+            )
 
             # 4. Trend analysis (ARIMA-inspired, pure pandas)
             trend_result = analyze_trend(df)
