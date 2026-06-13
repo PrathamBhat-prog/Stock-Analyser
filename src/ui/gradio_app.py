@@ -3,6 +3,12 @@
 Stock Market AI Analyser -- Gradio Frontend
 Port: 7860  ->  http://localhost:7860
 """
+import sys
+import os
+
+# Add project root to sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
