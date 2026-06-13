@@ -11,6 +11,12 @@ mlruns/
 # Trained models (regenerate with train.py)
 artifacts/
 
+# Old model files (keep only trading_model_sniper_v5.pkl)
+best_lstm.pt
+best_stock_lstm.pkl
+trading_model_v5.pkl
+colab_model_test.py
+
 # Runtime inference output
 decision.json
 
