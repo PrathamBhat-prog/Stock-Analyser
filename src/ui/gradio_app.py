@@ -517,4 +517,10 @@ OR pick from the popular stocks dropdown.
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, show_api=False)
+    import os
+    port = int(os.getenv("GRADIO_SERVER_PORT", 7860))
+    try:
+        demo.launch(server_name="0.0.0.0", server_port=port, show_api=False)
+    except OSError:
+        print(f"Port {port} is in use. Trying a random available port...")
+        demo.launch(server_name="0.0.0.0", server_port=0, show_api=False)
